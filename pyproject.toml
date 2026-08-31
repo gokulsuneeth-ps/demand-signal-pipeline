@@ -33,6 +33,7 @@ dev = [
     "ruff>=0.5",
     "mypy>=1.10",
     "pre-commit>=3.7",
+    "kaggle>=1.6",  # CLI used once to pull the M5 dataset, see docs/architecture.md
 ]
 
 [build-system]

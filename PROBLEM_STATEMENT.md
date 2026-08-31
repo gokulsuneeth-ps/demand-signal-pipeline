@@ -9,12 +9,14 @@ Forecast daily unit demand at **item × store** granularity, for a **28-day hori
 ## Dataset
 
 **M5 Forecasting — Accuracy** (Walmart, via the Makridakis M5 competition, hosted on Kaggle).
-Full dataset: ~30,490 item-store series across 10 stores in 3 US states, 3 years of daily history, with calendar events, SNAP-benefit flags, and sell prices.
+Full dataset: 30,490 item-store series across 10 stores in 3 US states, 5.4 years of daily history (2011-01-29 to 2016-06-19), with calendar events, SNAP-benefit flags, and sell prices.
 
-**Subset used here:** `FOODS` category, California stores only → roughly 1,400–1,800 series. Chosen because:
+**Subset used here:** `FOODS` category, California stores only → **5,748 series**, confirmed by actually running ingestion (day 2), not estimated. The arithmetic: FOODS has 1,437 unique items, California has 4 stores (CA_1–CA_4), 1,437 × 4 = 5,748. An earlier draft of this document guessed "roughly 1,400–1,800 series" without doing that multiplication — wrong, corrected here once the real pipeline produced a real number. Chosen because:
 - Food/grocery is the category with the clearest weekly seasonality and promo sensitivity — the part of the dataset where ML actually has something to learn over a naive seasonal baseline.
-- Single-state keeps daily backtesting fast enough to iterate on a laptop (full dataset backtesting is a multi-hour job; this subset should run in minutes).
+- Single-state keeps the subset well under the full 30,490-series dataset (~19% of it), which matters for backtesting turnaround on a laptop even though it's larger than first estimated.
 - Small enough to reason about by hand when debugging — you can pull up ten SKUs and actually look at them.
+
+11,156,868 rows result (5,748 series × 1,941 days each) — worth watching at day 4-5: rolling-origin backtesting across this many series will take longer per run than a ~1,500-series subset would have. If it turns out too slow to iterate on, the fallback is narrowing to CA_1 only (~1,437 series) rather than the whole state — noted here now so that's a documented fallback, not a scramble later.
 
 Full-dataset scaling is a stretch goal (see ROADMAP checklist), not a day-1–10 requirement.
 
