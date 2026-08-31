@@ -10,6 +10,8 @@ venv/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+.coverage
+htmlcov/
 
 # --- Env / secrets ---
 .env
@@ -40,8 +42,3 @@ mlartifacts/
 Thumbs.db
 .vscode/
 .idea/
-
-# --- GCP credentials ---
-gcp-key.json
-*-service-account*.json
-service-account*.json
