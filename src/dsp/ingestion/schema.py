@@ -1,94 +1,87 @@
-"""Pandera schemas for the raw -> bronze validation step.
+"""Pandera schemas for the M5 raw tables and the bronze long-format output.
 
-These exist to catch a bad raw download or a reshape bug LOUDLY, at
-ingestion time, rather than as a confusing downstream failure three
-pipeline stages later - the same "raise, don't silently degrade"
-discipline this project has applied everywhere else (metrics.py,
-backtest.py, baselines.py).
-
-Two schemas: `CalendarSchema` checks the raw calendar.csv exactly as
-downloaded; `BronzeSalesSchema` checks the RESHAPED long-format sales
-table `ingest.build_bronze` produces (one row per series per day), not
-the raw wide-format CSV (1,941 day columns is not something pandera's
-column-based checks are a good fit for - the wide file's own structural
-sanity, e.g. that every d_1..d_1941 column exists and is numeric, is
-checked directly in `ingest.py` instead, where the melt happens).
+Two levels of validation on purpose:
+  - Raw schemas (loose) catch a corrupted/incompatible download early, before
+    any reshaping happens — better to fail on `load_calendar()` than three
+    functions deep inside a merge.
+  - The bronze schema (strict) is the contract the rest of the pipeline
+    relies on. Day 3's feature functions are written assuming this schema
+    holds, so if it doesn't, they should never see the data at all.
 """
 
 from __future__ import annotations
 
-import pandas as pd
 import pandera.pandas as pa
-from pandera.pandas import Column, DataFrameSchema
+from pandera.typing import Series
 
-CalendarSchema = DataFrameSchema(
-    {
-        "date": Column(pa.DateTime),
-        "wm_yr_wk": Column(pa.Int, checks=pa.Check.ge(0)),
-        "wday": Column(pa.Int, checks=pa.Check.in_range(1, 7)),
-        "month": Column(pa.Int, checks=pa.Check.in_range(1, 12)),
-        "year": Column(pa.Int, checks=pa.Check.ge(2010)),
-        "d": Column(pa.String),
-        "event_name_1": Column(pa.String, nullable=True),
-        "event_type_1": Column(pa.String, nullable=True),
-        "event_name_2": Column(pa.String, nullable=True),
-        "event_type_2": Column(pa.String, nullable=True),
-        "snap_CA": Column(pa.Int, checks=pa.Check.isin([0, 1])),
-        "snap_TX": Column(pa.Int, checks=pa.Check.isin([0, 1])),
-        "snap_WI": Column(pa.Int, checks=pa.Check.isin([0, 1])),
-    },
-    strict=False,  # calendar.csv also has a "weekday" text column this project doesn't use
-    coerce=False,
-)
 
-BronzeSalesSchema = DataFrameSchema(
-    {
-        # These five id-ish columns are `category` dtype, not plain
-        # string, by deliberate design - see build_bronze's docstring
-        # in ingest.py: melting the wide raw file with these left as
-        # plain strings repeats every value once per day column and
-        # inflates the melted table roughly 6x, enough to OOM-kill the
-        # process on this project's actual sandbox. pd.CategoricalDtype()
-        # here accepts any category set (unconstrained), matching the
-        # role of these columns as identifiers, not a validated
-        # enumeration.
-        "id": Column(pd.CategoricalDtype()),
-        "item_id": Column(pd.CategoricalDtype()),
-        "dept_id": Column(pd.CategoricalDtype()),
-        "cat_id": Column(pd.CategoricalDtype()),
-        "store_id": Column(pd.CategoricalDtype()),
-        "state_id": Column(pd.CategoricalDtype()),
-        "date": Column(pa.DateTime),
-        # `d`, the two event-name and two event-type columns are
-        # `category` dtype, not plain string, for the same memory reason
-        # as the id columns above: see build_bronze's docstring in
-        # ingest.py. pd.CategoricalDtype() is unconstrained (any category
-        # set), and pandera's nullable check still applies on top of it.
-        "d": Column(pd.CategoricalDtype()),
-        "wm_yr_wk": Column(pa.Int32, checks=pa.Check.ge(0)),
-        "wday": Column(pa.Int8, checks=pa.Check.in_range(1, 7)),
-        "month": Column(pa.Int8, checks=pa.Check.in_range(1, 12)),
-        "year": Column(pa.Int16, checks=pa.Check.ge(2010)),
-        # Sales can never be negative - a real data-quality invariant, not
-        # a stylistic preference. A raw file that violates this should
-        # fail ingestion loudly, not silently propagate a negative
-        # "demand" number into every downstream metric and model.
-        "sales": Column(pa.Int, checks=pa.Check.ge(0)),
-        "event_name_1": Column(pd.CategoricalDtype(), nullable=True),
-        "event_type_1": Column(pd.CategoricalDtype(), nullable=True),
-        "event_name_2": Column(pd.CategoricalDtype(), nullable=True),
-        "event_type_2": Column(pd.CategoricalDtype(), nullable=True),
-        "snap_CA": Column(pa.Int8, checks=pa.Check.isin([0, 1])),
-        "snap_TX": Column(pa.Int8, checks=pa.Check.isin([0, 1])),
-        "snap_WI": Column(pa.Int8, checks=pa.Check.isin([0, 1])),
-    },
-    # No duplicate (id, date) rows - the single most important structural
-    # invariant of a "long format, one row per series per day" table.
-    # Every downstream stage (lag features, folds, backtest) silently
-    # assumes this holds; checking it once here means a reshape bug gets
-    # caught at ingestion, not as a mysterious doubled WAPE denominator
-    # three stages later.
-    unique=["id", "date"],
-    strict=True,
-    coerce=False,
-)
+class CalendarSchema(pa.DataFrameModel):
+    """`calendar.csv` as shipped by the M5 competition, loosely checked."""
+
+    date: Series[str]
+    wm_yr_wk: Series[int] = pa.Field(ge=11101)
+    weekday: Series[str]
+    wday: Series[int] = pa.Field(ge=1, le=7)
+    month: Series[int] = pa.Field(ge=1, le=12)
+    year: Series[int] = pa.Field(ge=2011, le=2016)
+    d: Series[str] = pa.Field(str_matches=r"^d_\d+$")
+    event_name_1: Series[str] = pa.Field(nullable=True)
+    event_type_1: Series[str] = pa.Field(nullable=True)
+    event_name_2: Series[str] = pa.Field(nullable=True)
+    event_type_2: Series[str] = pa.Field(nullable=True)
+    snap_CA: Series[int] = pa.Field(isin=[0, 1])
+    snap_TX: Series[int] = pa.Field(isin=[0, 1])
+    snap_WI: Series[int] = pa.Field(isin=[0, 1])
+
+    class Config:
+        coerce = True
+
+
+class SellPricesSchema(pa.DataFrameModel):
+    """`sell_prices.csv` as shipped by the M5 competition."""
+
+    store_id: Series[str]
+    item_id: Series[str]
+    wm_yr_wk: Series[int] = pa.Field(ge=11101)
+    sell_price: Series[float] = pa.Field(ge=0)
+
+    class Config:
+        coerce = True
+
+
+class BronzeSalesSchema(pa.DataFrameModel):
+    """The long-format table ingestion produces — the contract every
+    downstream stage (features, backtest, model) is written against.
+
+    `sales` must be a non-negative integer: a demand series with negative
+    units sold is a data bug, not a valid observation, and should fail loud
+    here rather than quietly poison a lag feature three stages downstream.
+    `sell_price` is nullable — an item can legitimately have no listed price
+    for a given week (e.g. before it was carried at that store).
+    """
+
+    id: Series[str]
+    item_id: Series[str]
+    dept_id: Series[str]
+    cat_id: Series[str]
+    store_id: Series[str]
+    state_id: Series[str]
+    d: Series[str] = pa.Field(str_matches=r"^d_\d+$")
+    sales: Series[int] = pa.Field(ge=0)
+    date: Series[str]
+    wm_yr_wk: Series[int] = pa.Field(ge=11101)
+    wday: Series[int] = pa.Field(ge=1, le=7)
+    month: Series[int] = pa.Field(ge=1, le=12)
+    year: Series[int] = pa.Field(ge=2011, le=2016)
+    event_name_1: Series[str] = pa.Field(nullable=True)
+    event_type_1: Series[str] = pa.Field(nullable=True)
+    event_name_2: Series[str] = pa.Field(nullable=True)
+    event_type_2: Series[str] = pa.Field(nullable=True)
+    snap_CA: Series[int] = pa.Field(isin=[0, 1])
+    snap_TX: Series[int] = pa.Field(isin=[0, 1])
+    snap_WI: Series[int] = pa.Field(isin=[0, 1])
+    sell_price: Series[float] = pa.Field(ge=0, nullable=True)
+
+    class Config:
+        coerce = True
+        strict = True  # reject unexpected columns — schema drift should fail loudly

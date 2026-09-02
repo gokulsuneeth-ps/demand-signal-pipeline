@@ -1,8 +1,9 @@
-"""Integration test for build_silver_features: end-to-end from bronze +
-prices through to the final silver table, checking the exact set of
+"""Integration test for build_silver_features: end-to-end from bronze
+(already carrying `sell_price` - ingestion's job, see build.py's module
+docstring) through to the final silver table, checking the exact set of
 columns downstream code (dsp.models.train) actually depends on is
 present, and that the pipeline steps compose correctly (a price feature
-computed from a correctly-merged price, a lag computed from real sales).
+computed from a real price, a lag computed from real sales).
 """
 
 from __future__ import annotations
@@ -24,10 +25,15 @@ EXPECTED_SILVER_COLUMNS = {
 }  # fmt: skip
 
 
-def _tiny_bronze_and_prices():
+def _tiny_bronze():
+    """Bronze with `sell_price` already populated, matching what
+    `dsp.ingestion.load.run_ingestion` actually hands to features - this
+    module never merges prices itself (see build.py's module docstring).
+    """
     dates = pd.date_range("2016-01-01", periods=35)
     bronze_rows = []
     for i, d in enumerate(dates):
+        week = 11101 + i // 7
         bronze_rows.append(
             {
                 "id": "FOODS_1_001_CA_1_evaluation",
@@ -38,11 +44,12 @@ def _tiny_bronze_and_prices():
                 "state_id": "CA",
                 "date": d,
                 "d": f"d_{i + 1}",
-                "wm_yr_wk": 11101 + i // 7,
+                "wm_yr_wk": week,
                 "wday": (i % 7) + 1,
                 "month": d.month,
                 "year": d.year,
                 "sales": (i % 5) + 1,
+                "sell_price": 3.98 if week % 2 == 0 else 4.48,
                 "event_name_1": "SuperBowl" if i == 5 else None,
                 "event_type_1": "Sporting" if i == 5 else None,
                 "event_name_2": None,
@@ -52,60 +59,54 @@ def _tiny_bronze_and_prices():
                 "snap_WI": 0,
             }
         )
-    bronze = pd.DataFrame(bronze_rows)
-
-    weeks = sorted(bronze["wm_yr_wk"].unique())
-    prices = pd.DataFrame(
-        {
-            "store_id": ["CA_1"] * len(weeks),
-            "item_id": ["FOODS_1_001"] * len(weeks),
-            "wm_yr_wk": weeks,
-            "sell_price": [3.98 if w % 2 == 0 else 4.48 for w in weeks],
-        }
-    )
-    return bronze, prices
+    return pd.DataFrame(bronze_rows)
 
 
 def test_build_silver_features_produces_expected_columns():
-    bronze, prices = _tiny_bronze_and_prices()
-    silver = build_silver_features(bronze, prices)
+    bronze = _tiny_bronze()
+    silver = build_silver_features(bronze)
     assert EXPECTED_SILVER_COLUMNS.issubset(set(silver.columns))
 
 
 def test_build_silver_features_preserves_row_count():
-    bronze, prices = _tiny_bronze_and_prices()
-    silver = build_silver_features(bronze, prices)
+    bronze = _tiny_bronze()
+    silver = build_silver_features(bronze)
     assert len(silver) == len(bronze)
 
 
-def _two_store_bronze_and_prices():
+def test_build_silver_features_raises_if_sell_price_missing():
+    """This module doesn't merge prices itself anymore - a bronze frame
+    that skipped ingestion's price merge should fail loudly, not produce
+    a silver table with NaN price features that look like "no discount
+    data" instead of "this frame is missing a required column."
+    """
+    bronze = _tiny_bronze().drop(columns=["sell_price"])
+    with pytest.raises(ValueError, match="sell_price"):
+        build_silver_features(bronze)
+
+
+def _two_store_bronze():
     """Two series in two different stores - the minimal case that
     actually exercises chunking (a single-store fixture would pass
     `build_silver_features_chunked` trivially with exactly one chunk).
     """
-    bronze_a, prices_a = _tiny_bronze_and_prices()
+    bronze_a = _tiny_bronze()
 
     bronze_b = bronze_a.copy()
     bronze_b["id"] = "FOODS_1_002_CA_2_evaluation"
     bronze_b["item_id"] = "FOODS_1_002"
     bronze_b["store_id"] = "CA_2"
     bronze_b["sales"] = bronze_b["sales"] + 10  # distinct values, not a copy-paste duplicate
+    bronze_b["sell_price"] = bronze_b["sell_price"] + 1.0
 
-    prices_b = prices_a.copy()
-    prices_b["store_id"] = "CA_2"
-    prices_b["item_id"] = "FOODS_1_002"
-    prices_b["sell_price"] = prices_b["sell_price"] + 1.0
-
-    bronze = pd.concat([bronze_a, bronze_b], ignore_index=True)
-    prices = pd.concat([prices_a, prices_b], ignore_index=True)
-    return bronze, prices
+    return pd.concat([bronze_a, bronze_b], ignore_index=True)
 
 
 def test_build_silver_features_chunked_matches_unchunked():
-    bronze, prices = _two_store_bronze_and_prices()
+    bronze = _two_store_bronze()
 
-    unchunked = build_silver_features(bronze.copy(), prices.copy())
-    chunked = build_silver_features_chunked(bronze.copy(), prices.copy(), chunk_col="store_id")
+    unchunked = build_silver_features(bronze.copy())
+    chunked = build_silver_features_chunked(bronze.copy(), chunk_col="store_id")
 
     unchunked = unchunked.sort_values(["id", "date"]).reset_index(drop=True)
     chunked = chunked.sort_values(["id", "date"]).reset_index(drop=True)
@@ -115,27 +116,31 @@ def test_build_silver_features_chunked_matches_unchunked():
 
 def test_build_silver_features_chunked_handles_stale_category_list():
     """Regression test for a real bug hit against the actual M5 data:
-    `id` is `category` dtype (see schema.py), and filtering a chunk's
-    ROWS does not shrink its category LIST - a chunk built from a wider
-    frame still carries every category that existed before filtering,
-    most with zero rows in this chunk. Grouping by that column without
-    `observed=True` iterates the empty categories too, and pandas'
-    rolling-window code crashed outright on an empty group
-    (`IndexError: index -1 is out of bounds for axis 0 with size 0` in
-    `add_price_features`'s `.rolling(...)` call) - this only reproduces
-    when the `id` column's category list is wider than what's actually
-    present in the chunk being processed, which is exactly what this
-    test sets up by building bronze from a 3-store universe and then
-    only chunk-processing 2 of those stores' data.
-    """
-    bronze, prices = _two_store_bronze_and_prices()
+    when `id` is `category` dtype, filtering a chunk's ROWS does not
+    shrink its category LIST - a chunk built from a wider frame still
+    carries every category that existed before filtering, most with zero
+    rows in this chunk. Grouping by that column without `observed=True`
+    iterates the empty categories too, and pandas' rolling-window code
+    crashed outright on an empty group (`IndexError: index -1 is out of
+    bounds for axis 0 with size 0` in `add_price_features`'s
+    `.rolling(...)` call) - this only reproduces when the `id` column's
+    category list is wider than what's actually present in the chunk
+    being processed, which is exactly what this test sets up by building
+    bronze from a 3-store universe and then only chunk-processing 2 of
+    those stores' data.
 
-    bronze_c, prices_c = _tiny_bronze_and_prices()
+    Note: `dsp.ingestion.load`'s bronze is currently plain `str`/object
+    dtype for `id` (see schema.py's `Series[str]`), not `category` - this
+    test exists so the chunked path stays correct if/when a category-
+    dtype memory optimization is added to ingestion later, not because
+    it's required for correctness against today's bronze shape.
+    """
+    bronze = _two_store_bronze()
+
+    bronze_c = _tiny_bronze()
     bronze_c["id"] = "FOODS_1_003_CA_3_evaluation"
     bronze_c["item_id"] = "FOODS_1_003"
     bronze_c["store_id"] = "CA_3"
-    prices_c["store_id"] = "CA_3"
-    prices_c["item_id"] = "FOODS_1_003"
 
     full_bronze = pd.concat([bronze, bronze_c], ignore_index=True)
     for col in ["id", "item_id", "store_id"]:
@@ -147,23 +152,23 @@ def test_build_silver_features_chunked_handles_stale_category_list():
     ca3_only_bronze = full_bronze[full_bronze["store_id"] == "CA_3"].copy()
     assert len(ca3_only_bronze["id"].cat.categories) > ca3_only_bronze["id"].nunique()
 
-    result = build_silver_features_chunked(ca3_only_bronze, prices_c, chunk_col="store_id")
+    result = build_silver_features_chunked(ca3_only_bronze, chunk_col="store_id")
     assert result["id"].nunique() == 1
     assert len(result) == len(ca3_only_bronze)
 
 
 def test_build_silver_features_chunked_raises_if_chunk_col_splits_an_id():
-    bronze, prices = _tiny_bronze_and_prices()
+    bronze = _tiny_bronze()
     # `d` varies within every single id (that's the whole point of `d`) -
     # chunking on it would silently split every series' own history
     # across chunks, exactly the bug the safety check exists to catch.
     with pytest.raises(ValueError, match="span more than one"):
-        build_silver_features_chunked(bronze, prices, chunk_col="d")
+        build_silver_features_chunked(bronze, chunk_col="d")
 
 
 def test_build_silver_features_price_and_lag_values_are_real_not_placeholder():
-    bronze, prices = _tiny_bronze_and_prices()
-    silver = build_silver_features(bronze, prices).sort_values("date").reset_index(drop=True)
+    bronze = _tiny_bronze()
+    silver = build_silver_features(bronze).sort_values("date").reset_index(drop=True)
 
     assert silver["sell_price"].notna().all()
     assert set(silver["sell_price"].unique()) == {3.98, 4.48}

@@ -16,7 +16,7 @@ from dsp.features.calendar import (
     add_is_weekend,
 )
 from dsp.features.lags import add_lag_features, add_rolling_features
-from dsp.features.prices import add_price_features, merge_prices
+from dsp.features.prices import add_price_features
 
 # --- calendar features ---
 
@@ -152,59 +152,17 @@ def test_add_rolling_features_nan_until_full_window_available():
 
 
 # --- price features ---
+#
+# Note: merging sell_price onto bronze is ingestion's job now
+# (dsp.ingestion.load.enrich_with_prices, tested in test_ingestion.py),
+# not this module's - see prices.py's module docstring for why a
+# duplicate merge used to live here and was removed as a latent bug.
 
 
-def test_merge_prices_joins_on_store_item_week():
-    bronze = pd.DataFrame(
-        {
-            "id": ["A"] * 2,
-            "store_id": ["CA_1"] * 2,
-            "item_id": ["FOODS_1_001"] * 2,
-            "wm_yr_wk": [11101, 11102],
-        }
-    )
-    prices = pd.DataFrame(
-        {
-            "store_id": ["CA_1", "CA_1"],
-            "item_id": ["FOODS_1_001", "FOODS_1_001"],
-            "wm_yr_wk": [11101, 11102],
-            "sell_price": [3.98, 4.48],
-        }
-    )
-    out = merge_prices(bronze, prices)
-    assert out["sell_price"].tolist() == [3.98, 4.48]
-
-
-def test_merge_prices_leaves_missing_price_as_nan_not_zero():
-    bronze = pd.DataFrame(
-        {"id": ["A"], "store_id": ["CA_1"], "item_id": ["FOODS_1_001"], "wm_yr_wk": [99999]}
-    )
-    prices = pd.DataFrame(
-        {
-            "store_id": ["CA_1"],
-            "item_id": ["FOODS_1_001"],
-            "wm_yr_wk": [11101],
-            "sell_price": [3.98],
-        }
-    )
-    out = merge_prices(bronze, prices)
-    assert pd.isna(out["sell_price"].iloc[0])
-
-
-def test_merge_prices_raises_on_duplicate_price_rows():
-    bronze = pd.DataFrame(
-        {"id": ["A"], "store_id": ["CA_1"], "item_id": ["FOODS_1_001"], "wm_yr_wk": [11101]}
-    )
-    duplicated_prices = pd.DataFrame(
-        {
-            "store_id": ["CA_1", "CA_1"],
-            "item_id": ["FOODS_1_001", "FOODS_1_001"],
-            "wm_yr_wk": [11101, 11101],
-            "sell_price": [3.98, 4.48],  # two different prices for the same week - bad data
-        }
-    )
-    with pytest.raises(ValueError, match="row count changed"):
-        merge_prices(bronze, duplicated_prices)
+def test_add_price_features_raises_if_sell_price_column_missing():
+    df = pd.DataFrame({"id": ["A"], "date": pd.date_range("2016-01-01", periods=1)})
+    with pytest.raises(ValueError, match="sell_price"):
+        add_price_features(df)
 
 
 def test_add_price_features_matches_hand_calculation():

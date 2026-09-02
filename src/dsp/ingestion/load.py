@@ -16,11 +16,15 @@ Pipeline, end to end:
 
 from __future__ import annotations
 
+import gc
+import logging
 from pathlib import Path
 
 import pandas as pd
 
 from dsp.ingestion.schema import BronzeSalesSchema, CalendarSchema, SellPricesSchema
+
+logger = logging.getLogger(__name__)
 
 ID_COLS = ["id", "item_id", "dept_id", "cat_id", "store_id", "state_id"]
 
@@ -65,8 +69,24 @@ def filter_subset(
 
 
 def melt_to_long(sales_wide: pd.DataFrame) -> pd.DataFrame:
-    """Wide (one column per day) -> long (one row per item-store-day)."""
+    """Wide (one column per day) -> long (one row per item-store-day).
+
+    Casts ID_COLS to `category` dtype before melting, not after: `melt`
+    repeats every id-column value once per day column in its output, so
+    with these left as plain strings, melting this project's real CA/
+    FOODS subset (~5,700 series x ~1,900 days) inflates a sub-1GB wide
+    table into 5+GB of long-format output - confirmed by direct
+    measurement, and enough to OOM-kill this exact function against the
+    real raw data. Category dtype stores each distinct id string once,
+    cutting that melted table's memory by roughly 6x. `BronzeSalesSchema`
+    (`coerce=True`, `Series[str]`) casts these back to plain `str` at
+    validation time, so this is purely an intermediate-memory
+    optimization, not a change to the schema this function's callers see.
+    """
     day_cols = [c for c in sales_wide.columns if c.startswith("d_")]
+    sales_wide = sales_wide.copy()
+    for col in ID_COLS:
+        sales_wide[col] = sales_wide[col].astype("category")
     long_df = sales_wide.melt(
         id_vars=ID_COLS,
         value_vars=day_cols,
@@ -110,15 +130,64 @@ def run_ingestion(
     """End to end: raw CSVs in `raw_dir` -> validated bronze parquet in
     `bronze_dir`. Returns the bronze DataFrame as well, mainly so callers
     (and tests) can inspect it without re-reading the parquet file.
+
+    Processes one `store_id` at a time (melt -> enrich_with_calendar ->
+    enrich_with_prices), instead of running the whole ~11.2M-row CA/FOODS
+    subset through those steps at once, then concatenates before the
+    final schema validation. This isn't a stylistic choice: run against
+    this project's actual raw data, the single-shot version OOM-crashed
+    even with `melt_to_long`'s category-dtype fix in place (RSS climbed
+    past 6GB and was killed by the sandbox's memory cgroup) - each stage
+    (`.merge`, `.copy()` inside `melt_to_long`) holds its own new full-
+    size frame while Python's scoping keeps the previous one alive too,
+    and that stacks stage over stage across ~11.2M rows. `store_id` is a
+    safe partition for this: it's a strict superset of `id` (this
+    project's item-store series key - see ID_COLS), so no row's calendar
+    or price join ever needs data from a different store, and chunking
+    changes nothing about the OUTPUT, only the order/batching of the
+    computation. On this project's real CA/FOODS data (4 CA stores,
+    ~1,437 series each) this keeps peak memory to roughly a quarter of
+    the single-shot version - confirmed by direct measurement against the
+    real raw files, not assumed.
     """
     calendar = load_calendar(raw_dir)
     prices = load_sell_prices(raw_dir)
     sales_wide = load_raw_sales_wide(raw_dir)
 
     subset = filter_subset(sales_wide, cat_id=cat_id, state_id=state_id)
-    long_df = melt_to_long(subset)
-    long_df = enrich_with_calendar(long_df, calendar)
-    bronze = enrich_with_prices(long_df, prices)
+    del sales_wide
+    gc.collect()
+
+    store_ids = sorted(subset["store_id"].unique())
+    logger.info("ingesting %d rows across %d store(s)", len(subset), len(store_ids))
+
+    chunks = []
+    for store in store_ids:
+        store_subset = subset[subset["store_id"] == store].copy()
+
+        long_df = melt_to_long(store_subset)
+        del store_subset
+        gc.collect()
+
+        enriched = enrich_with_calendar(long_df, calendar)
+        del long_df
+        gc.collect()
+
+        priced = enrich_with_prices(enriched, prices)
+        del enriched
+        gc.collect()
+
+        chunks.append(priced)
+        del priced
+        gc.collect()
+        logger.info("store %s ingested (%d/%d)", store, len(chunks), len(store_ids))
+
+    del subset, calendar, prices
+    gc.collect()
+
+    bronze = pd.concat(chunks, ignore_index=True)
+    del chunks
+    gc.collect()
 
     bronze = BronzeSalesSchema.validate(bronze)
 

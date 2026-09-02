@@ -1,8 +1,16 @@
-"""Combines bronze + prices + every feature module into the final silver
-feature table - the single function `dsp.orchestration.assets` calls for
-the "features" pipeline stage, and the same shape/columns every model in
+"""Combines bronze + every feature module into the final silver feature
+table - the single function `dsp.orchestration.assets` calls for the
+"features" pipeline stage, and the same shape/columns every model in
 `dsp.models` already depends on (see `dsp.models.train.EXCLUDED_COLS` /
 `CATEGORICAL_COLS` for the exact columns downstream code expects).
+
+Takes bronze ALONE, not bronze + a separate prices table - `sell_price`
+is already merged into bronze by ingestion (`dsp.ingestion.load.
+enrich_with_prices`, run before `BronzeSalesSchema.validate`), so this
+module's job starts after that's already true. See `prices.py`'s module
+docstring for why a second, independent price merge used to live here and
+was removed - it was a latent bug (a second merge colliding with the
+`sell_price` column ingestion already produced), not a feature.
 """
 
 from __future__ import annotations
@@ -14,38 +22,37 @@ import pandas as pd
 
 from dsp.features.calendar import add_calendar_features
 from dsp.features.lags import add_lag_features, add_rolling_features
-from dsp.features.prices import add_price_features, merge_prices
+from dsp.features.prices import add_price_features
 
 logger = logging.getLogger(__name__)
 
 
-def build_silver_features(bronze_df: pd.DataFrame, prices_df: pd.DataFrame) -> pd.DataFrame:
-    """Runs the full bronze -> silver feature pipeline in the one order
-    that is actually correct: prices must be merged in BEFORE
-    `add_price_features` can compute anything from `sell_price`, and
-    lag/rolling sales features only need `sales` + `id` + `date`, so
-    their order relative to the price steps doesn't matter - but calendar
-    features are applied first here regardless, simply because they're
-    cheapest and have no dependency on anything else in this function.
+def build_silver_features(bronze_df: pd.DataFrame) -> pd.DataFrame:
+    """Runs the full bronze -> silver feature pipeline. Calendar features
+    are applied first simply because they're cheapest and have no
+    dependency on anything else in this function; price features need
+    `sell_price` (already on `bronze_df` - see module docstring), and lag/
+    rolling sales features only need `sales` + `id` + `date`, so neither
+    has an ordering dependency on the other.
 
     Explicitly `del`s each stage's input immediately after producing the
     next stage's output, followed by `gc.collect()`. This isn't
-    stylistic: every `add_*`/`merge_*` function below does its own
-    defensive `df.copy()` (so callers never have a function silently
-    mutate a frame out from under them), and on this project's real CA/
-    FOODS data (~11.2M rows) each copy is ~2-3GB. Without explicitly
-    dropping the superseded reference, Python's local-variable scoping
-    keeps the OLD frame alive for the rest of this function's body even
-    though it's never read again (a local name isn't freed just because
-    it's unused - only when reassigned, deleted, or the function
-    returns), so every stage would hold two full copies at once and stack
-    on top of the previous stage's now-orphaned memory. That is exactly
-    what OOM-killed this pipeline the first time it ran against the real
-    raw data: RSS climbed stage over stage (~2GB -> ~4.4GB and rising)
-    instead of holding steady at roughly one frame's worth. Freeing each
-    predecessor the moment it's superseded keeps peak memory bounded to
-    ~2 live copies (old + new) during a single stage's `.copy()), not N
-    stages' worth stacked on top of each other.
+    stylistic: every `add_*` function below does its own defensive
+    `df.copy()` (so callers never have a function silently mutate a frame
+    out from under them), and on this project's real CA/FOODS data
+    (~11.2M rows) each copy is ~2-3GB. Without explicitly dropping the
+    superseded reference, Python's local-variable scoping keeps the OLD
+    frame alive for the rest of this function's body even though it's
+    never read again (a local name isn't freed just because it's unused -
+    only when reassigned, deleted, or the function returns), so every
+    stage would hold two full copies at once and stack on top of the
+    previous stage's now-orphaned memory. That is exactly what OOM-killed
+    this pipeline the first time it ran against the real raw data: RSS
+    climbed stage over stage (~2GB -> ~4.4GB and rising) instead of
+    holding steady at roughly one frame's worth. Freeing each predecessor
+    the moment it's superseded keeps peak memory bounded to ~2 live
+    copies (old + new) during a single stage's `.copy()`, not N stages'
+    worth stacked on top of each other.
     """
     logger.info("building silver features from %d bronze rows", len(bronze_df))
 
@@ -53,28 +60,24 @@ def build_silver_features(bronze_df: pd.DataFrame, prices_df: pd.DataFrame) -> p
     del bronze_df
     gc.collect()
 
-    out2 = merge_prices(out, prices_df)
-    del out, prices_df
+    out2 = add_price_features(out)
+    del out
     gc.collect()
 
-    out3 = add_price_features(out2)
+    out3 = add_lag_features(out2)
     del out2
     gc.collect()
 
-    out4 = add_lag_features(out3)
+    out4 = add_rolling_features(out3)
     del out3
     gc.collect()
 
-    out5 = add_rolling_features(out4)
-    del out4
-    gc.collect()
-
-    logger.info("silver feature table: %d rows, %d columns", len(out5), out5.shape[1])
-    return out5
+    logger.info("silver feature table: %d rows, %d columns", len(out4), out4.shape[1])
+    return out4
 
 
 def build_silver_features_chunked(
-    bronze_df: pd.DataFrame, prices_df: pd.DataFrame, chunk_col: str = "store_id"
+    bronze_df: pd.DataFrame, chunk_col: str = "store_id"
 ) -> pd.DataFrame:
     """Same output as `build_silver_features`, computed one `chunk_col`
     value at a time and concatenated, to bound peak memory on large real
@@ -143,20 +146,13 @@ def build_silver_features_chunked(
         for col in bronze_chunk.select_dtypes(include="category").columns:
             bronze_chunk[col] = bronze_chunk[col].cat.remove_unused_categories()
 
-        relevant_items = bronze_chunk["item_id"].astype(str).unique()
-        relevant_stores = bronze_chunk["store_id"].astype(str).unique()
-        prices_chunk = prices_df[
-            prices_df["item_id"].astype(str).isin(relevant_items)
-            & prices_df["store_id"].astype(str).isin(relevant_stores)
-        ].copy()
-
-        silver_chunk = build_silver_features(bronze_chunk, prices_chunk)
+        silver_chunk = build_silver_features(bronze_chunk)
         results.append(silver_chunk)
-        del bronze_chunk, prices_chunk, silver_chunk
+        del bronze_chunk, silver_chunk
         gc.collect()
         logger.info("chunk %s done (%d/%d)", value, len(results), len(chunk_values))
 
-    del bronze_df, prices_df
+    del bronze_df
     gc.collect()
 
     out = pd.concat(results, ignore_index=True)

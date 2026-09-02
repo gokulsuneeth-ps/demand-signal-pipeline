@@ -17,6 +17,7 @@ from dsp.ingestion.load import (
     enrich_with_prices,
     filter_subset,
     melt_to_long,
+    run_ingestion,
 )
 from dsp.ingestion.schema import BronzeSalesSchema
 
@@ -158,3 +159,73 @@ def test_bronze_schema_rejects_unexpected_column(sales_wide, calendar, prices):
     # single-failure SchemaError a Field check like ge=0 raises above.
     with pytest.raises(pandera.errors.SchemaErrors):
         BronzeSalesSchema.validate(bronze, lazy=True)
+
+
+def test_run_ingestion_end_to_end_across_multiple_stores(tmp_path):
+    """`run_ingestion` now processes one store_id at a time internally
+    (see its docstring - a real OOM fix for this project's actual CA/
+    FOODS scale), so this is the one test that actually exercises that
+    chunking loop and the final concat, not just the single-store
+    per-function tests above. Two stores is the minimum that can catch a
+    chunking bug (a single store would pass trivially with one chunk).
+    """
+    raw_dir = tmp_path / "raw"
+    bronze_dir = tmp_path / "bronze"
+    raw_dir.mkdir()
+
+    sales_wide = pd.DataFrame(
+        {
+            "id": ["FOODS_1_CA_1", "FOODS_1_CA_2", "FOODS_1_TX_1"],
+            "item_id": ["FOODS_1", "FOODS_1", "FOODS_1"],
+            "dept_id": ["FOODS_1", "FOODS_1", "FOODS_1"],
+            "cat_id": ["FOODS", "FOODS", "FOODS"],
+            "store_id": ["CA_1", "CA_2", "TX_1"],
+            "state_id": ["CA", "CA", "TX"],
+            "d_1": [3, 7, 5],
+            "d_2": [1, 2, 4],
+            "d_3": [0, 1, 2],
+        }
+    )
+    sales_wide.to_csv(raw_dir / "sales_train_evaluation.csv", index=False)
+
+    calendar = pd.DataFrame(
+        {
+            "date": ["2011-01-29", "2011-01-30", "2011-01-31"],
+            "wm_yr_wk": [11101, 11101, 11101],
+            "weekday": ["Saturday", "Sunday", "Monday"],
+            "wday": [1, 2, 3],
+            "month": [1, 1, 1],
+            "year": [2011, 2011, 2011],
+            "d": ["d_1", "d_2", "d_3"],
+            "event_name_1": [None, None, "NewYear"],
+            "event_type_1": [None, None, "National"],
+            "event_name_2": [None, None, None],
+            "event_type_2": [None, None, None],
+            "snap_CA": [0, 1, 1],
+            "snap_TX": [1, 1, 0],
+            "snap_WI": [0, 0, 0],
+        }
+    )
+    calendar.to_csv(raw_dir / "calendar.csv", index=False)
+
+    prices = pd.DataFrame(
+        {
+            "store_id": ["CA_1", "CA_2"],
+            "item_id": ["FOODS_1", "FOODS_1"],
+            "wm_yr_wk": [11101, 11101],
+            "sell_price": [3.98, 4.48],
+        }
+    )
+    prices.to_csv(raw_dir / "sell_prices.csv", index=False)
+
+    bronze = run_ingestion(raw_dir=raw_dir, bronze_dir=bronze_dir, cat_id="FOODS", state_id="CA")
+
+    # 2 CA/FOODS series x 3 days = 6 rows; TX_1 must be filtered out
+    assert len(bronze) == 6
+    assert set(bronze["id"]) == {"FOODS_1_CA_1", "FOODS_1_CA_2"}
+    assert (bronze_dir / "sales_long.parquet").exists()
+
+    ca1_price = bronze.query("id == 'FOODS_1_CA_1' and d == 'd_1'").iloc[0]["sell_price"]
+    ca2_price = bronze.query("id == 'FOODS_1_CA_2' and d == 'd_1'").iloc[0]["sell_price"]
+    assert ca1_price == 3.98
+    assert ca2_price == 4.48
