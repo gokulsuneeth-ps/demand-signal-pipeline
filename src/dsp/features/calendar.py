@@ -1,67 +1,85 @@
-"""Calendar/event features.
+"""Calendar/event features (day-of-week, holiday flags, SNAP flags).
 
-Pure functions: DataFrame in, DataFrame out, no side effects. Each is
-individually unit-tested rather than only checked as part of the full
-pipeline, so a bug here shows up as one failing test pointing at one
-function, not a confusing failure three stages downstream.
+Each function here is a pure function (DataFrame in, DataFrame out),
+trivially unit-testable without spinning up the full pipeline, matching
+the day-1 stub's stated intent.
 """
 
 from __future__ import annotations
 
 import pandas as pd
 
-# Maps a series' state to the correct SNAP-benefit column. The current
-# subset (PROBLEM_STATEMENT.md) is CA-only, so only snap_CA is ever
-# selected in practice today — but writing this as a lookup rather than
-# hardcoding snap_CA means adding TX/WI later is a data-scope change, not
-# a code change.
-_SNAP_COLUMN_BY_STATE = {"CA": "snap_CA", "TX": "snap_TX", "WI": "snap_WI"}
+# M5's own convention (confirmed against the real calendar.csv): wday=1 is
+# Saturday, wday=2 is Sunday - the M5 week starts Saturday, not Monday.
+WEEKEND_WDAY_VALUES = {1, 2}
 
 
-def add_weekend_flag(df: pd.DataFrame) -> pd.DataFrame:
-    """Adds `is_weekend` from the actual calendar date, not M5's `wday`
-    column — M5's wday numbering (1=Saturday) is easy to misread as
-    Python's `.dayofweek` (0=Monday), so deriving it fresh from `date`
-    avoids a whole class of off-by-one bugs.
+def add_is_weekend(df: pd.DataFrame) -> pd.DataFrame:
+    """Adds `is_weekend` from the `wday` column, using M5's own
+    Saturday=1/Sunday=2 weekend convention (not Python's Monday=0
+    convention) - stated explicitly since silently assuming the wrong
+    convention would mislabel every single row without ever raising an
+    error.
     """
     out = df.copy()
-    dow = pd.to_datetime(out["date"]).dt.dayofweek  # 0=Mon ... 6=Sun
-    out["is_weekend"] = dow.isin([5, 6]).astype(int)
+    out["is_weekend"] = out["wday"].isin(WEEKEND_WDAY_VALUES).astype(int)
     return out
 
 
-def add_event_flag(df: pd.DataFrame) -> pd.DataFrame:
-    """`is_event`: 1 if either of M5's two event slots is populated.
-    Deliberately collapsed to a single binary flag rather than one-hot
-    encoding every event name — with this subset's row count, a rare
-    event name would be a near-constant column that helps LightGBM very
-    little and mostly adds noise. Event *type* (Sporting/Cultural/etc.)
-    is left as a stretch feature, not built here.
+def add_is_event(df: pd.DataFrame) -> pd.DataFrame:
+    """Adds `is_event`: 1 if EITHER event_name_1 or event_name_2 is set
+    for that day (a day can have two named events, e.g. a religious
+    observance overlapping a sporting event) - checking only
+    event_name_1 would silently miss every day where only the second
+    event slot was populated.
     """
     out = df.copy()
-    out["is_event"] = (out["event_name_1"].notna() | out["event_name_2"].notna()).astype(int)
+    has_event_1 = out["event_name_1"].notna()
+    has_event_2 = out["event_name_2"].notna()
+    out["is_event"] = (has_event_1 | has_event_2).astype(int)
     return out
 
 
-def add_snap_flag(df: pd.DataFrame) -> pd.DataFrame:
-    """`is_snap_day`: whether SNAP (food-assistance) benefits are usable
-    that day in the series' own state — a real demand driver for a FOODS
-    category specifically, unlike a generic "any state's SNAP day" flag
-    would be.
+def add_is_snap_day(df: pd.DataFrame) -> pd.DataFrame:
+    """Adds `is_snap_day`: whether THIS ROW'S OWN STATE had SNAP
+    (food-assistance) benefits active that day.
+
+    This is the one calendar feature that must be read per-row, not from
+    a single fixed column: the raw calendar table carries separate
+    snap_CA/snap_TX/snap_WI columns, and a row's relevant column depends
+    on its OWN `state_id` - a Texas row must read snap_TX, not snap_CA.
+    Reading a single hardcoded snap column (e.g. always snap_CA) would
+    silently produce the wrong flag for every non-CA row; this project's
+    actual scope is CA-only, but this function is written correctly for
+    any state mix rather than quietly baking in that scope assumption.
+
+    Raises if `state_id` contains a value with no matching snap_<STATE>
+    column, rather than silently leaving is_snap_day undefined (e.g. as
+    NaN) for those rows.
     """
     out = df.copy()
-    if out["state_id"].nunique() > 1:
-        # Correct but slower per-row lookup, only pays its cost once the
-        # subset actually spans multiple states.
-        col_per_row = out["state_id"].map(_SNAP_COLUMN_BY_STATE)
-        out["is_snap_day"] = [out.loc[i, col] for i, col in col_per_row.items()]
-    else:
-        state = out["state_id"].iloc[0]
-        out["is_snap_day"] = out[_SNAP_COLUMN_BY_STATE[state]]
-    out["is_snap_day"] = out["is_snap_day"].astype(int)
+    states = out["state_id"].unique()
+    missing_cols = [s for s in states if f"snap_{s}" not in out.columns]
+    if missing_cols:
+        raise ValueError(
+            f"add_is_snap_day: no snap_<STATE> column for state_id value(s) "
+            f"{missing_cols} - expected one of {[c for c in out.columns if c.startswith('snap_')]}"
+        )
+
+    out["is_snap_day"] = 0
+    for state in states:
+        mask = out["state_id"] == state
+        out.loc[mask, "is_snap_day"] = out.loc[mask, f"snap_{state}"].astype(int)
     return out
 
 
 def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Convenience wrapper applying all three calendar features in order."""
-    return add_snap_flag(add_event_flag(add_weekend_flag(df)))
+    """Convenience wrapper applying all three calendar features in the
+    project's standard order. Each function above stays independently
+    testable and usable on its own; this is just what `features/build.py`
+    actually calls.
+    """
+    out = add_is_weekend(df)
+    out = add_is_event(out)
+    out = add_is_snap_day(out)
+    return out

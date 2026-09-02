@@ -1,78 +1,80 @@
-"""Lag and rolling-window features on `sales` — the target variable.
+"""Lag and rolling-window features.
 
-The single rule that matters more than anything else in this file: a
-feature for day t must only use information available strictly before
-day t. `sales` is the thing being forecast, so any statistic derived from
-it has to be shifted before use — get this wrong and the backtest in
-day 4 will report a suspiciously good number that has no relationship to
-real forecasting accuracy, because the model was secretly allowed to see
-the answer.
+Watch for leakage here specifically: any rolling stat must only look
+backward from the forecast origin, never forward - this is the single
+most common bug in demand-forecasting feature pipelines and the first
+thing a reviewer should check for.
 
-Contrast with `sell_price` (see prices.py): a retailer sets prices in
-advance, so today's price is legitimately known before today's sales
-happen. That is NOT the same situation as `sales` itself, and is not
-lagged the same way.
+Concretely: a naive `df.groupby("id")["sales"].rolling(7).mean()`
+computes each day's 7-day average INCLUDING that day's own sales value -
+information the model would never actually have at forecast time, since
+forecasting today's sales using today's own sales is circular. Every
+rolling function here calls `.shift(1)` before `.rolling(...)`, so a
+day's rolling stat reflects only the days strictly BEFORE it. This is
+verified directly by a dedicated leakage test in tests/test_lags.py, not
+just asserted in a comment.
 """
 
 from __future__ import annotations
 
 import pandas as pd
 
-LAG_DAYS = [7, 14, 28]
-ROLLING_WINDOWS = [7, 28]
+DEFAULT_LAGS = (7, 14, 28)
+DEFAULT_ROLLING_WINDOWS = (7, 28)
 
 
-def _sorted(df: pd.DataFrame) -> pd.DataFrame:
-    """Every function below assumes rows are in (id, date) order — pandas
-    `groupby(...).shift()` / `.rolling()` operate on row order, not on the
-    `date` column's values, so an unsorted frame silently produces
-    garbage instead of an error. Centralized here so every feature
-    function gets it for free instead of relying on the caller to
-    remember.
+def add_lag_features(
+    df: pd.DataFrame,
+    lags: tuple[int, ...] = DEFAULT_LAGS,
+    id_col: str = "id",
+    date_col: str = "date",
+) -> pd.DataFrame:
+    """Adds `sales_lag_<N>` for each N in `lags`: that series' own sales
+    value exactly N days earlier.
+
+    Requires `df` to already be sorted by (id_col, date_col) with no
+    missing calendar days per series - `shift(N)` is a positional shift,
+    not a date-aware one, so a gap in a series' date range would
+    silently produce a lag value from the wrong actual day. `df` is
+    re-sorted defensively inside this function rather than trusting the
+    caller, but a gap in dates is NOT checked here (that is
+    `assemble_fold_frames`'/backtest-time concern, not this pure
+    feature function's) - stated explicitly since it's a real,
+    non-obvious precondition.
     """
-    return df.sort_values(["id", "date"]).reset_index(drop=True)
-
-
-def add_lag_features(df: pd.DataFrame, lag_days: list[int] = LAG_DAYS) -> pd.DataFrame:
-    """Adds `sales_lag_{n}` for each n in `lag_days`: the actual sales
-    value from n days before, per series. `groupby("id")` keeps series
-    from bleeding into each other at the boundary — without it, the first
-    few rows of series B would incorrectly pick up trailing values from
-    series A.
-    """
-    out = _sorted(df)
-    grouped = out.groupby("id", sort=False)["sales"]
-    for n in lag_days:
-        out[f"sales_lag_{n}"] = grouped.shift(n)
+    out = df.sort_values([id_col, date_col]).copy()
+    grouped_sales = out.groupby(id_col, observed=True)["sales"]
+    for lag in lags:
+        out[f"sales_lag_{lag}"] = grouped_sales.shift(lag)
     return out
 
 
-def add_rolling_features(df: pd.DataFrame, windows: list[int] = ROLLING_WINDOWS) -> pd.DataFrame:
-    """Adds `sales_rollmean_{w}` and `sales_rollstd_{w}` for each window.
+def add_rolling_features(
+    df: pd.DataFrame,
+    windows: tuple[int, ...] = DEFAULT_ROLLING_WINDOWS,
+    id_col: str = "id",
+    date_col: str = "date",
+) -> pd.DataFrame:
+    """Adds `sales_rollmean_<N>` and `sales_rollstd_<N>` for each N in
+    `windows`: the trailing N-day mean/std of that series' sales, NOT
+    including the current day (see module docstring - `.shift(1)` before
+    `.rolling(N)` is what enforces this).
 
-    The leakage-prevention step is `.shift(1)` BEFORE `.rolling(w)`: a
-    naive `groupby("id")["sales"].rolling(w).mean()` would include the
-    current day's own sales inside its own rolling average — the model
-    would then partially be predicting sales from sales, which inflates
-    backtest accuracy in a way that evaporates the moment it faces a real
-    unseen day. Shifting first means the window for day t covers
-    [t-w, t-1], never t itself.
+    `min_periods` is left at pandas' default (equal to the window size),
+    so a day without a full N days of prior history gets NaN rather than
+    a rolling stat quietly computed from fewer, weaker data points and
+    presented as equally reliable - consistent with this project's
+    established preference (day 3/5) for leaving missing signal as NaN
+    for the model to see, not zero-filling or otherwise disguising it.
     """
-    out = _sorted(df)
-    grouped = out.groupby("id", sort=False)["sales"]
-    for w in windows:
-        # transform (not a manual regroup-then-reset_index) is what keeps
-        # this correctly aligned to `out`'s row order — an earlier draft
-        # regrouped the already-shifted Series by id without sort=False,
-        # which pandas can silently reorder alphabetically by group,
-        # scrambling every row's feature value against the wrong id.
-        # transform guarantees the result comes back in the original
-        # frame's row order every time, which is why it's used here
-        # instead of the more "obvious" shift-then-regroup pattern.
-        out[f"sales_rollmean_{w}"] = grouped.transform(
-            lambda s, w=w: s.shift(1).rolling(w, min_periods=1).mean()
-        )
-        out[f"sales_rollstd_{w}"] = grouped.transform(
-            lambda s, w=w: s.shift(1).rolling(w, min_periods=2).std()
-        )
+    out = df.sort_values([id_col, date_col]).copy()
+    shifted = out.groupby(id_col, observed=True)["sales"].shift(1)
+    out["_shifted_sales_for_rolling"] = shifted
+
+    for window in windows:
+        rolling = out.groupby(id_col, observed=True)["_shifted_sales_for_rolling"].rolling(window)
+        out[f"sales_rollmean_{window}"] = rolling.mean().reset_index(level=0, drop=True)
+        out[f"sales_rollstd_{window}"] = rolling.std().reset_index(level=0, drop=True)
+
+    out = out.drop(columns=["_shifted_sales_for_rolling"])
     return out
