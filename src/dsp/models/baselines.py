@@ -27,43 +27,58 @@ def seasonal_naive_forecast(
     test_df: pd.DataFrame,
     season_length: int = 7,
 ) -> pd.DataFrame:
-    """Predicts each (id, date) in test_df using that series' own actual
-    sales value from `season_length` days earlier, read directly out of
-    train_df.
+    """Predicts each (id, date) in test_df by cycling that series' own
+    actual sales from the LAST REAL WEEK of history in train_df.
 
-    This only produces a correct forecast if every day of the test
-    window resolves back to a REAL day already in train_df - i.e.
-    horizon <= season_length. A wider window would need day N's
-    prediction to reach back into day N-7, which for N > 7 days into the
-    window is itself a forecasted (not actual) day - a different,
-    error-compounding algorithm, not seasonal-naive. Raises rather than
-    silently doing that.
+    For a horizon no wider than one season (the common case), this is
+    just "use the value from `season_length` days earlier," which is a
+    real actual day in train_df. For a wider horizon (e.g. this
+    project's real 28-day horizon with season_length=7), day N days past
+    train_end can't simply look back N-7 days for N > 7 - that day is
+    itself inside the forecast window, not an actual. Instead this
+    repeats the last real season (the final `season_length` days of
+    train_df) as many times as needed: the lookback for a day `offset`
+    days past train_end is `offset` days minus however many whole
+    seasons have elapsed, i.e.
 
-    Also raises if a specific (id, date - season_length) lookup is
-    missing from train_df. Given `assemble_fold_frames` already
-    guarantees `min_train_days` of history per included series, this
-    should never trigger for a correctly configured harness - if it
-    does, min_train_days is set too small relative to season_length, and
-    that is a configuration bug worth surfacing immediately rather than
-    as a mysterious WAPE number three layers away.
+        lookback_date = date - season_length * ceil(offset / season_length)
+
+    which always lands on a real actual date in train_df (never on
+    another forecasted day), and is a strict generalization of the
+    previous `date - season_length` rule: whenever horizon <=
+    season_length, ceil(offset / season_length) == 1 for every day in
+    the window, so this reduces to exactly the old lookup. This is also
+    the same convention the M5 competition itself uses for its own
+    28-day seasonal-naive baseline.
+
+    Also raises if a specific computed lookup is missing from train_df.
+    Given `assemble_fold_frames` already guarantees `min_train_days` of
+    history per included series, this should never trigger for a
+    correctly configured harness - if it does, min_train_days is set too
+    small relative to season_length, and that is a configuration bug
+    worth surfacing immediately rather than as a mysterious WAPE number
+    three layers away.
     """
-    test_dates = pd.to_datetime(test_df["date"])
-    horizon = (test_dates.max() - test_dates.min()).days + 1
-    if horizon > season_length:
-        raise ValueError(
-            f"seasonal_naive_forecast requires horizon <= season_length "
-            f"(got horizon={horizon}, season_length={season_length}); a wider "
-            f"window would forecast from other forecasted days, not actuals"
-        )
-
     train = train_df.copy()
     train["date"] = pd.to_datetime(train["date"])
+    train_end = train["date"].max()
     lookup = train.set_index(["id", "date"])["sales"]
 
     test = test_df.copy()
     test["date"] = pd.to_datetime(test["date"])
-    lookup_dates = test["date"] - pd.Timedelta(days=season_length)
-    lookup_keys = list(zip(test["id"], lookup_dates, strict=True))
+    offset_days = (test["date"] - train_end).dt.days
+    # offset_days > 0 is the normal case (test strictly follows train_end):
+    # ceil(offset/season_length) seasons back. Some callers (e.g.
+    # ets_forecast's per-series fallback) pass a train_df/test_df pair
+    # whose "train" wasn't cut at a hard fold boundary and can overlap the
+    # test window; for those (offset_days <= 0) fall back to exactly one
+    # season back, matching this function's original, unconditional
+    # `date - season_length` behavior rather than inventing a new rule for
+    # a case this fold-based cycling logic isn't meant to describe.
+    ceil_seasons = -(-offset_days // season_length)  # ceil division, valid for offset_days > 0
+    seasons_elapsed = ceil_seasons.where(offset_days > 0, 1)
+    lookback_dates = test["date"] - pd.to_timedelta(season_length * seasons_elapsed, unit="D")
+    lookup_keys = list(zip(test["id"], lookback_dates, strict=True))
 
     missing = [k for k in lookup_keys if k not in lookup.index]
     if missing:

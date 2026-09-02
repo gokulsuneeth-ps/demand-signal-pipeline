@@ -39,11 +39,45 @@ def test_seasonal_naive_matches_hand_calculation(one_series_16_days):
     assert preds.iloc[3]["prediction"] == 13
 
 
-def test_seasonal_naive_raises_when_horizon_exceeds_season_length(one_series_16_days):
-    test_dates = pd.date_range("2016-01-13", periods=8)
-    test = pd.DataFrame({"id": ["A"] * 8, "date": test_dates})
-    with pytest.raises(ValueError):
-        seasonal_naive_forecast(one_series_16_days, test, season_length=7)
+def test_seasonal_naive_cycles_last_real_week_when_horizon_exceeds_season_length():
+    """Regression test for the horizon > season_length generalization:
+    PROBLEM_STATEMENT.md's real horizon is 28 days against a 7-day
+    season_length, which the original implementation rejected outright.
+    Uses a long, easily hand-checked history (values equal to day index)
+    so each cycled lookback is easy to verify by hand.
+    """
+    dates = pd.date_range("2016-01-01", periods=60)  # day index 1..60
+    train = pd.DataFrame({"id": ["A"] * 60, "date": dates, "sales": list(range(1, 61))})
+    # train_end = day 60 (2016-01-01 + 59 days). Test window: 28 days
+    # starting the day after train_end.
+    test_dates = pd.date_range(dates[-1] + pd.Timedelta(days=1), periods=28)
+    test = pd.DataFrame({"id": ["A"] * 28, "date": test_dates})
+
+    preds = seasonal_naive_forecast(train, test, season_length=7)
+
+    # offset=1 (day 61) -> ceil(1/7)=1 season back -> day 61-7=54 -> value 54
+    assert preds.iloc[0]["prediction"] == 54
+    # offset=7 (day 67) -> ceil(7/7)=1 season back -> day 67-7=60 -> value 60
+    assert preds.iloc[6]["prediction"] == 60
+    # offset=8 (day 68) -> ceil(8/7)=2 seasons back -> day 68-14=54 -> value 54
+    assert preds.iloc[7]["prediction"] == 54
+    # offset=28 (day 88) -> ceil(28/7)=4 seasons back -> day 88-28=60 -> value 60
+    assert preds.iloc[27]["prediction"] == 60
+
+
+def test_seasonal_naive_matches_old_behavior_when_horizon_within_season_length(
+    one_series_16_days,
+):
+    """The cycling formula must be a strict generalization: for horizon <=
+    season_length, it must reduce to exactly the original date -
+    season_length lookup - re-asserts the pre-existing hand-calculation
+    test still holds under the new implementation.
+    """
+    test_dates = pd.date_range("2016-01-17", periods=4)
+    test = pd.DataFrame({"id": ["A"] * 4, "date": test_dates})
+    preds = seasonal_naive_forecast(one_series_16_days, test, season_length=7)
+    assert preds.iloc[0]["prediction"] == 10
+    assert preds.iloc[3]["prediction"] == 13
 
 
 def test_seasonal_naive_raises_on_missing_lookup():
