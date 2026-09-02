@@ -30,7 +30,10 @@ dependencies = [
 dev = [
     "pytest>=8.2",
     "pytest-cov>=5.0",
-    "ruff>=0.5",
+    "ruff==0.5.0",  # pinned exactly, matching .pre-commit-config.yaml - an
+    # unbounded >=0.5 let CI silently install a newer ruff whose import-sort
+    # rules disagree with 0.5.0's (caught when CI failed on files that had
+    # passed every local/pre-commit check, all run against the 0.5.0 pin)
     "mypy>=1.10",
     "pre-commit>=3.7",
     "kaggle>=1.6",  # CLI used once to pull the M5 dataset, see docs/architecture.md
